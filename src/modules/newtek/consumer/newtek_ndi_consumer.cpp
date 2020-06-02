@@ -34,11 +34,14 @@
 #include <common/future.h>
 #include <common/param.h>
 #include <common/timer.h>
+#include <common/executor.h>
 
 #include <boost/algorithm/string.hpp>
 #include <boost/property_tree/ptree.hpp>
 
 #include "../util/ndi.h"
+
+static void com_initialize() {}
 
 namespace caspar { namespace newtek {
 
@@ -60,6 +63,16 @@ struct newtek_ndi_consumer : public core::frame_consumer
     caspar::timer                        frame_timer_;
     int                                  frame_no_;
 
+    executor                             executor_;
+    executor                             send_loop_;
+    const int                            buffer_size_ = 3;
+    std::mutex                           buffer_mutex_;
+    std::condition_variable              buffer_cond_;
+    std::queue<core::const_frame>        buffer_;
+    int                                  buffer_capacity_ = 1;
+    std::atomic<bool>                    abort_request_{false};
+    std::atomic<int64_t>                 current_encoding_delay_;
+
     std::unique_ptr<NDIlib_send_instance_t, std::function<void(NDIlib_send_instance_t*)>> ndi_send_instance_;
 
   public:
@@ -69,6 +82,8 @@ struct newtek_ndi_consumer : public core::frame_consumer
         , frame_no_(0)
         , allow_fields_(allow_fields)
         , channel_index_(0)
+        , executor_(L"NDI Consumer [" + std::to_wstring(channel_index_) + L"]")
+        , send_loop_(L"NDI Consumer Send loop [" + std::to_wstring(channel_index_) + L"]")
     {
         ndi_lib_ = ndi::load_library();
         graph_->set_text(print());
@@ -76,6 +91,8 @@ struct newtek_ndi_consumer : public core::frame_consumer
         graph_->set_color("tick-time", diagnostics::color(0.0f, 0.6f, 0.9f));
         graph_->set_color("dropped-frame", diagnostics::color(0.3f, 0.6f, 0.3f));
         diagnostics::register_graph(graph_);
+        executor_.begin_invoke([=] { com_initialize(); });
+        send_loop_.begin_invoke([=] { send_loop(); });
     }
 
     ~newtek_ndi_consumer() {}
@@ -91,6 +108,8 @@ struct newtek_ndi_consumer : public core::frame_consumer
 
         auto tmp_name                   = u8(name_);
         NDI_send_create_desc.p_ndi_name = tmp_name.c_str();
+        NDI_send_create_desc.clock_audio = false;
+        NDI_send_create_desc.clock_video = true;
 
         ndi_send_instance_ = {new NDIlib_send_instance_t(ndi_lib_->NDIlib_send_create(&NDI_send_create_desc)),
                               [this](auto p) { this->ndi_lib_->NDIlib_send_destroy(*p); }};
@@ -116,11 +135,56 @@ struct newtek_ndi_consumer : public core::frame_consumer
         ndi_audio_frame_.no_channels = format_desc_.audio_channels;
         ndi_audio_frame_.timecode    = NDIlib_send_timecode_synthesize;
 
+
         graph_->set_text(print());
         // CASPAR_VERIFY(ndi_send_instance_);
     }
 
-    std::future<bool> send(core::const_frame frame) override
+    std::future<bool> send(core::const_frame frame) override {
+         return executor_.begin_invoke([=] {
+            if (!frame) {
+                return !abort_request_;
+            }
+
+            {
+                std::unique_lock<std::mutex> lock(buffer_mutex_);
+                buffer_cond_.wait(lock, [&] { return buffer_.size() < buffer_capacity_ || abort_request_; });
+                buffer_.push(std::move(frame));
+            }
+            buffer_cond_.notify_all();
+
+            return !abort_request_;
+         });
+    }
+
+    core::const_frame pop()
+    {
+        core::const_frame frame;
+        {
+            std::unique_lock<std::mutex> lock(buffer_mutex_);
+            buffer_cond_.wait(lock, [&] { return !buffer_.empty() || abort_request_; });
+            if (!abort_request_) {
+                frame = std::move(buffer_.front());
+                buffer_.pop();
+            }
+        }
+        buffer_cond_.notify_all();
+        return frame;
+    }
+
+    void send_loop() {
+        //Queue frames before we start
+        while (!abort_request_) {
+            if (buffer_.size() < buffer_size_)
+                continue;
+        }
+        while (!abort_request_) {
+            core::const_frame frame (pop());
+            send_local(frame);
+        }
+    }
+
+    std::future<bool> send_local(core::const_frame frame)
     {
         CASPAR_VERIFY(format_desc_.height * format_desc_.width * 4 == frame.image_data(0).size());
 
@@ -143,7 +207,7 @@ struct newtek_ndi_consumer : public core::frame_consumer
         } else {
             ndi_video_frame_.p_data = const_cast<uint8_t*>(frame.image_data(0).begin());
         }
-        ndi_lib_->NDIlib_send_send_video_v2(*ndi_send_instance_, &ndi_video_frame_);
+        ndi_lib_->NDIlib_send_send_video_async_v2(*ndi_send_instance_, &ndi_video_frame_);
         frame_no_++;
         graph_->set_value("frame-time", frame_timer_.elapsed() * format_desc_.fps * 0.5);
 
@@ -168,7 +232,7 @@ struct newtek_ndi_consumer : public core::frame_consumer
 
     int index() const override { return 900; }
 
-    bool has_synchronization_clock() const override { return false; }
+    bool has_synchronization_clock() const override { return true; }
 };
 
 std::atomic<int> newtek_ndi_consumer::instances_(0);
